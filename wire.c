@@ -250,8 +250,8 @@ size_t encode_REGISTER( uint8_t * base,
         retval += encode_sock( base, idx, &(reg->sock) );
     }
 
-    retval += encode_buf( base, idx, reg->version, 16 );
-    retval += encode_buf( base, idx, reg->os_name, 16 );
+    retval += encode_buf( base, idx, reg->version, sizeof(reg->version) );
+    retval += encode_buf( base, idx, reg->os_name, sizeof(reg->os_name) );
 
     return retval;
 }
@@ -273,14 +273,14 @@ size_t decode_REGISTER( n2n_REGISTER_t * reg,
         retval += decode_sock( &(reg->sock), base, rem, idx );
     }
 
-    if (*rem >= 16) {
-        retval += decode_buf( reg->version, 16, base, rem, idx );
+    if (*rem >= sizeof(reg->version)) {
+        retval += decode_buf( reg->version, sizeof(reg->version), base, rem, idx );
     } else {
         strcpy(reg->version, "unknown");
     }
 
-    if (*rem >= 16) {
-        retval += decode_buf( reg->os_name, 16, base, rem, idx );
+    if (*rem >= sizeof(reg->os_name)) {
+        retval += decode_buf( reg->os_name, sizeof(reg->os_name), base, rem, idx );
     } else {
         strcpy(reg->os_name, "unknown");
     }

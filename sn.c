@@ -40,6 +40,241 @@
 static unsigned int count_communities(struct peer_info *edges);
 static uint32_t next_assigned_ip = 0x0a400002; /* 10.64.0.2 */
 
+/* ============================================================
+ * Per-community traffic statistics and rate limiting
+ * ============================================================ */
+
+#define COMM_STATS_MINUTES   1440   /* 24h in 1-minute buckets */
+#define COMM_STATS_DAYS      30     /* 30-day rolling window */
+#define COMM_STATS_SECONDS   5      /* instant rate averaging window */
+#define RATE_LIMIT_FACTOR    1.05   /* token bucket overshoot factor */
+
+struct community_stats {
+    n2n_community_t community_name;
+
+    /* Instant rate (COMM_STATS_SECONDS-second rolling average) */
+    uint64_t recent_seconds[COMM_STATS_SECONDS];
+    int      recent_idx;
+    time_t   last_second;
+    uint64_t instant_bps;
+
+    /* 24-hour sliding window (1-minute buckets) */
+    uint64_t bytes_1440[COMM_STATS_MINUTES];
+    int      min_idx;
+    time_t   last_minute;
+    uint64_t last_24h_bytes;
+
+    /* 30-day rolling window (1-day buckets) */
+    uint64_t bytes_30d[COMM_STATS_DAYS];
+    int      day_idx;
+    time_t   last_day;
+    uint64_t total_30d;
+
+    /* Total bytes since stats start */
+    uint64_t total_bytes;
+    time_t   stats_start_time;
+    time_t   last_active;
+
+    /* Rate limiting */
+    uint64_t max_24h_bytes;     /* 0 = unlimited */
+    uint64_t rate_limit_bps;    /* throttle speed after 24h limit; 0 = block */
+    uint64_t tokens;            /* token bucket (bytes) */
+    time_t   last_token_refill;
+
+    struct community_stats *next;
+};
+
+/* Rate limiting rule loaded from config file */
+struct rate_limit_rule {
+    n2n_community_t community_name; /* "*" matches all */
+    uint64_t        max_24h_bytes;
+    uint64_t        rate_limit_bps;
+    struct rate_limit_rule *next;
+};
+
+/* Find or create community stats entry */
+static struct community_stats * get_community_stats(
+        struct community_stats **head,
+        const n2n_community_t community,
+        time_t now)
+{
+    struct community_stats *s = *head;
+    while (s) {
+        if (memcmp(s->community_name, community, sizeof(n2n_community_t)) == 0)
+            return s;
+        s = s->next;
+    }
+    s = (struct community_stats*)calloc(1, sizeof(struct community_stats));
+    if (!s) return NULL;
+    memcpy(s->community_name, community, sizeof(n2n_community_t));
+    s->stats_start_time = now;
+    s->last_day    = now;
+    s->last_minute = now;
+    s->last_second = now;
+    s->next = *head;
+    *head = s;
+    return s;
+}
+
+/* Update traffic counters for a community */
+static void update_community_traffic(struct community_stats *s, size_t bytes, time_t now)
+{
+    s->total_bytes += bytes;
+    s->last_active  = now;
+
+    /* Instant rate */
+    if (now != s->last_second) {
+        s->last_second = now;
+        s->recent_idx  = (s->recent_idx + 1) % COMM_STATS_SECONDS;
+        s->recent_seconds[s->recent_idx] = 0;
+        uint64_t total = 0;
+        for (int k = 0; k < COMM_STATS_SECONDS; k++) total += s->recent_seconds[k];
+        s->instant_bps = total / COMM_STATS_SECONDS;
+    }
+    s->recent_seconds[s->recent_idx] += bytes;
+
+    /* 24h sliding window */
+    if (now - s->last_minute >= 60) {
+        s->last_minute = now;
+        s->min_idx = (s->min_idx + 1) % COMM_STATS_MINUTES;
+        s->last_24h_bytes -= s->bytes_1440[s->min_idx];
+        s->bytes_1440[s->min_idx] = 0;
+    }
+    s->bytes_1440[s->min_idx] += bytes;
+    s->last_24h_bytes += bytes;
+
+    /* 30-day rolling window */
+    if (now - s->last_day >= 86400) {
+        s->last_day = now;
+        s->day_idx  = (s->day_idx + 1) % COMM_STATS_DAYS;
+        s->total_30d -= s->bytes_30d[s->day_idx];
+        s->bytes_30d[s->day_idx] = 0;
+    }
+    s->bytes_30d[s->day_idx] += bytes;
+    s->total_30d += bytes;
+}
+
+/* Check rate limit; returns 1 if packet should be allowed, 0 if blocked/throttled */
+static int check_rate_limit(struct community_stats *s, size_t bytes, time_t now)
+{
+    if (s->max_24h_bytes == 0 && s->rate_limit_bps == 0)
+        return 1; /* no limit */
+
+    uint64_t total_24h = s->last_24h_bytes + s->bytes_1440[s->min_idx];
+
+    if (s->max_24h_bytes > 0 && total_24h >= s->max_24h_bytes) {
+        if (s->rate_limit_bps == 0)
+            return 0; /* hard block */
+        /* throttle via token bucket */
+        if (s->last_token_refill == 0) {
+            s->last_token_refill = now;
+            s->tokens = (uint64_t)(s->rate_limit_bps * RATE_LIMIT_FACTOR);
+        }
+        time_t elapsed = now - s->last_token_refill;
+        if (elapsed > 0) {
+            s->last_token_refill = now;
+            s->tokens += (uint64_t)(elapsed * s->rate_limit_bps * RATE_LIMIT_FACTOR);
+            uint64_t max_tokens = (uint64_t)(s->rate_limit_bps * 5 * RATE_LIMIT_FACTOR);
+            if (s->tokens > max_tokens) s->tokens = max_tokens;
+        }
+        if (s->tokens < bytes) return 0;
+        s->tokens -= bytes;
+    }
+    return 1;
+}
+
+/* Apply rules from config to a community stats entry */
+static void apply_rules_to_stats(struct community_stats *s,
+                                  struct rate_limit_rule *rules)
+{
+    s->max_24h_bytes  = 0;
+    s->rate_limit_bps = 0;
+    struct rate_limit_rule *r = rules;
+    while (r) {
+        if (strcmp((char*)r->community_name, "*") == 0 ||
+            memcmp(r->community_name, s->community_name, sizeof(n2n_community_t)) == 0) {
+            s->max_24h_bytes  = r->max_24h_bytes;
+            s->rate_limit_bps = r->rate_limit_bps;
+            if (strcmp((char*)r->community_name, (char*)s->community_name) == 0)
+                break; /* specific rule wins over wildcard */
+        }
+        r = r->next;
+    }
+}
+
+/* Free all community stats */
+static void free_community_stats(struct community_stats **head)
+{
+    struct community_stats *s = *head;
+    while (s) {
+        struct community_stats *next = s->next;
+        free(s);
+        s = next;
+    }
+    *head = NULL;
+}
+
+/* Free all rate limit rules */
+static void free_rate_limit_rules(struct rate_limit_rule **head)
+{
+    struct rate_limit_rule *r = *head;
+    while (r) {
+        struct rate_limit_rule *next = r->next;
+        free(r);
+        r = next;
+    }
+    *head = NULL;
+}
+
+/* Parse -L config file */
+static void parse_rate_limit_config(const char *path,
+                                     int *enabled,
+                                     struct rate_limit_rule **rules)
+{
+    free_rate_limit_rules(rules);
+    *enabled = 0;
+
+    FILE *fp = fopen(path, "r");
+    if (!fp) {
+        /* Create default config */
+        fp = fopen(path, "w");
+        if (fp) {
+            fprintf(fp, "# Traffic statistics and rate limiting configuration\n");
+            fprintf(fp, "# enabled on|off\n");
+            fprintf(fp, "# Format: <community> <rate_limit_KB/s> <max_24h_traffic_GB>\n");
+            fprintf(fp, "# Example: n2n  10  50\n");
+            fprintf(fp, "# Example: *    0   100   (global 100GB/24h hard block)\n");
+            fprintf(fp, "enabled on\n");
+            fclose(fp);
+        }
+        *enabled = 1;
+        return;
+    }
+
+    struct rate_limit_rule *tail = NULL;
+    char line[256];
+    while (fgets(line, sizeof(line), fp)) {
+        if (line[0] == '#' || line[0] == '\n') continue;
+        char kw[64], val[64];
+        if (sscanf(line, "%63s %63s", kw, val) == 2 &&
+            strcmp(kw, "enabled") == 0) {
+            *enabled = (strcmp(val, "on") == 0) ? 1 : 0;
+            continue;
+        }
+        double rate_kbps, max_gb;
+        if (sscanf(line, "%63s %lf %lf", kw, &rate_kbps, &max_gb) == 3) {
+            struct rate_limit_rule *r = (struct rate_limit_rule*)calloc(1, sizeof(*r));
+            if (!r) continue;
+            strncpy((char*)r->community_name, kw, sizeof(n2n_community_t) - 1);
+            r->rate_limit_bps = (uint64_t)(rate_kbps * 1024);
+            r->max_24h_bytes  = (uint64_t)(max_gb * 1024.0 * 1024.0 * 1024.0);
+            if (!tail) { *rules = r; tail = r; }
+            else { tail->next = r; tail = r; }
+        }
+    }
+    fclose(fp);
+}
+
 struct sn_stats
 {
     size_t errors;              /* Number of errors encountered. */
@@ -67,6 +302,11 @@ struct n2n_sn
     n2n_trans_op_t      transop[N2N_MAX_TRANSFORMS];
     int                 ipv4_available; /* 0=unavailable, 1=available */
     int                 ipv6_available; /* 0=unavailable, 1=available */
+    /* Traffic stats and rate limiting */
+    int                    traffic_stats_enabled;
+    char                   stats_config_path[256];
+    struct community_stats *comm_stats;
+    struct rate_limit_rule *rate_rules;
 };
 
 typedef struct n2n_sn n2n_sn_t;
@@ -536,6 +776,21 @@ static int try_forward( n2n_sn_t * sss,
     struct peer_info *  scan;
     macstr_t            mac_buf;
     n2n_sock_str_t      sockbuf;
+    time_t              now = time(NULL);
+
+    /* Rate limiting check */
+    if (sss->traffic_stats_enabled) {
+        struct community_stats *cs = get_community_stats(&sss->comm_stats,
+                                                          cmn->community, now);
+        if (cs) {
+            apply_rules_to_stats(cs, sss->rate_rules);
+            if (!check_rate_limit(cs, pktsize, now)) {
+                traceEvent(TRACE_DEBUG, "rate limit drop for community %s", cmn->community);
+                return 0;
+            }
+            update_community_traffic(cs, pktsize, now);
+        }
+    }
 
     scan = find_peer_by_mac( sss->edges, dstMac );
 
@@ -610,7 +865,7 @@ static int process_mgmt( n2n_sn_t * sss,
 
     /* Send header */
     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                      "  id  mac                virt_ip          wan_ip                                           ver      os\n");
+                      "  id  mac                virt_ip          wan_ip               <KB/s     GB/24h   GB/30d>  ver      os\n");
     ressize += snprintf(resbuf + ressize, N2N_SN_PKTBUF_SIZE - ressize,
                        "---n2n6----------------------------------------------------------------------------------------------------\n");
 
@@ -677,8 +932,25 @@ static int process_mgmt( n2n_sn_t * sss,
     /* Second pass: display edges grouped by community */
     uint32_t displayed_edges = 0;
     for (int i = 0; i < num_communities; i++) {
-        /* Send community name */
-        ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", communities[i]);
+        /* Community name line with traffic stats on same line */
+        if (sss->traffic_stats_enabled) {
+            struct community_stats *cs = sss->comm_stats;
+            while (cs && memcmp(cs->community_name, communities[i], sizeof(n2n_community_t)) != 0)
+                cs = cs->next;
+            if (cs && cs->total_bytes > 0) {
+                double kbps   = cs->instant_bps / 1024.0;
+                double gb_24h = cs->last_24h_bytes / (1024.0*1024.0*1024.0);
+                double gb_30d = cs->total_30d / (1024.0*1024.0*1024.0);
+                const char *arrow = (kbps > 0.0) ? "--->" : "    ";
+                ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
+                                   "%-57s  %s %-7.1f  %-7.1f  %-10.1f\n",
+                                   communities[i], arrow, kbps, gb_24h, gb_30d);
+            } else {
+                ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", communities[i]);
+            }
+        } else {
+            ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE, "%s\n", communities[i]);
+        }
         r = sendto(sss->mgmt_sock, resbuf, ressize, 0,
                   sender_sock, sender_sock_len);
         if (r <= 0) return -1;
@@ -725,12 +997,16 @@ static int process_mgmt( n2n_sn_t * sss,
 
             struct in_addr a;
             a.s_addr = htonl(edge->assigned_ip);
-            const char *ip_str = (edge->assigned_ip != 0) ? inet_ntoa(a) : "-";
+            char virt_ip[20] = "-";
+            if (edge->assigned_ip != 0)
+                snprintf(virt_ip, sizeof(virt_ip), "%s", inet_ntoa(a));
+
             ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                              "  %2u  %-17s  %-15s  %-47s  %-7s  %s\n",
+                          //  "  %2u  %-17s  %-20s %-26s  %-7s  %s\n",
+				              "  %2u  %-17s  %-15s  %-47s  %-7s  %s\n",
                               id++,
                               macaddr_str(mac_buf, edge->mac_addr),
-                              ip_str,
+                              virt_ip,
                               sock_to_cstr(sock_buf, &edge->sock),
                               version,
                               os_name);
@@ -746,6 +1022,27 @@ static int process_mgmt( n2n_sn_t * sss,
     }
 
     num_edges = displayed_edges;
+
+    /* Traffic Total line - before the footer separator */
+    if (sss->traffic_stats_enabled) {
+        double total_kbps = 0.0, total_24h = 0.0, total_30d = 0.0;
+        struct community_stats *cs = sss->comm_stats;
+        while (cs) {
+            total_kbps += cs->instant_bps / 1024.0;
+            total_24h  += cs->last_24h_bytes / (1024.0*1024.0*1024.0);
+            total_30d  += cs->total_30d / (1024.0*1024.0*1024.0);
+            cs = cs->next;
+        }
+        if (total_30d > 0 || total_24h > 0 || total_kbps > 0) {
+            const char *tarrow = (total_kbps > 0.0) ? "--->" : "    ";
+            ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
+                               "-------------\n"
+                               "Total traffic                                              %s %-7.1f  %-7.1f  %-10.1f\n",
+                               tarrow, total_kbps, total_24h, total_30d);
+            sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
+            ressize = 0;
+        }
+    }
 
     /* Send footer and statistics */
     ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
@@ -803,8 +1100,24 @@ static int try_broadcast( n2n_sn_t * sss,
     struct peer_info *  scan;
     macstr_t            mac_buf;
     n2n_sock_str_t      sockbuf;
+    time_t              now = time(NULL);
 
     traceEvent( TRACE_DEBUG, "try_broadcast" );
+
+    /* Rate limiting check for broadcast */
+    if (sss->traffic_stats_enabled) {
+        struct community_stats *cs = get_community_stats(&sss->comm_stats,
+                                                          cmn->community, now);
+        if (cs) {
+            apply_rules_to_stats(cs, sss->rate_rules);
+            if (!check_rate_limit(cs, pktsize, now)) {
+                traceEvent(TRACE_DEBUG, "rate limit drop broadcast for community %s",
+                           cmn->community);
+                return 0;
+            }
+            update_community_traffic(cs, pktsize, now);
+        }
+    }
 
     scan = sss->edges;
     while(scan != NULL)
@@ -999,6 +1312,28 @@ static int process_udp( n2n_sn_t * sss,
         sss->stats.last_fwd=now;
         decode_REGISTER( &reg, &cmn, udp_buf, &rem, &idx );
 
+        /* Update version/os_name in peer record from REGISTER packet */
+        {
+            struct peer_info *p = find_peer_by_mac(sss->edges, reg.srcMac);
+            if (p) {
+                if (reg.version[0] != '\0')
+                    strncpy(p->version, reg.version, sizeof(p->version) - 1);
+                if (reg.os_name[0] != '\0')
+                    strncpy(p->os_name, reg.os_name, sizeof(p->os_name) - 1);
+            }
+        }
+
+        /* Update version/os_name in peer record from REGISTER packet */
+        {
+            struct peer_info *p = find_peer_by_mac(sss->edges, reg.srcMac);
+            if (p) {
+                if (reg.version[0] != '\0')
+                    strncpy(p->version, reg.version, sizeof(p->version) - 1);
+                if (reg.os_name[0] != '\0')
+                    strncpy(p->os_name, reg.os_name, sizeof(p->os_name) - 1);
+            }
+        }
+
         unicast = (0 == is_multi_broadcast(reg.dstMac) );
 
         if ( unicast )
@@ -1164,7 +1499,7 @@ static int process_udp( n2n_sn_t * sss,
 
         int is_new_edge = update_edge( sss, reg.edgeMac, cmn.community, &(ack.sock),
                      local_sock_ptr, local_sock_ena,
-                     now, "", "", use_request_ip, htonl(use_requested_ip) );
+                     now, NULL, NULL, use_request_ip, use_requested_ip );
 
         /* Set assigned IP in ACK */
         if (use_request_ip) {
@@ -1247,6 +1582,7 @@ static void help(int argc, char * const argv[])
     printf("\n");
 
     fprintf( stderr, "-l <lport>\tSet UDP main listen port to <lport>\n" );
+    fprintf( stderr, "-L <file> \tEnable traffic stats and rate limiting (config file)\n" );
     fprintf( stderr, "-4|-6     \tIP mode: -4 (IPv4 only), -6 (IPv6 only), both/none (dual-stack)\n" );
  #ifndef _WIN32
     fprintf( stderr, "-t <port>\tSet management UDP port to <port> (default: 5646)\n" );
@@ -1306,13 +1642,22 @@ int main( int argc, char * const argv[] )
     {
         int opt;
 
-        while((opt = getopt_long(argc, argv, "ft:l:46vh", long_options, NULL)) != -1)
+        while((opt = getopt_long(argc, argv, "ft:l:L:46vh", long_options, NULL)) != -1)
         {
             switch (opt)
             {
             case 'l': /* local-port */
                 sss.lport = atoi(optarg);
 																lport_specified = 1;
+                break;
+            case 'L': /* traffic stats and rate limiting config */
+                strncpy(sss.stats_config_path, optarg, sizeof(sss.stats_config_path) - 1);
+                parse_rate_limit_config(sss.stats_config_path,
+                                        &sss.traffic_stats_enabled,
+                                        &sss.rate_rules);
+                traceEvent(TRACE_NORMAL, "Traffic stats %s, config: %s",
+                           sss.traffic_stats_enabled ? "enabled" : "disabled",
+                           sss.stats_config_path);
                 break;
             case 't':
 #ifndef _WIN32
@@ -1534,5 +1879,7 @@ static int run_loop( n2n_sn_t * sss )
     }
 
     deinit_sn( sss );
+    free_community_stats( &sss->comm_stats );
+    free_rate_limit_rules( &sss->rate_rules );
     return 0;
 }

@@ -775,8 +775,10 @@ static void send_register( n2n_edge_t * eee,
     encode_mac( reg.srcMac, &idx, eee->device.mac_addr );
 
     /* Attach our LAN address so the peer can try direct LAN connect */
-    if ( eee->local_sock_ena )
+    if ( eee->local_sock_ena ) {
         reg.sock = eee->local_sock;
+        cmn.flags |= N2N_FLAGS_SOCKET;
+    }
 
     idx=0;
     encode_REGISTER( pktbuf, &idx, &cmn, &reg );
