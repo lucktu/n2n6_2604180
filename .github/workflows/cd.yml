@@ -161,13 +161,13 @@ jobs:
           echo "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Set cache key
-        if: endsWith(matrix.TARGET, '_AES')
+        if: runner.os == 'windows'
         id: cache-key
         run: |
           echo "CACHE_KEY=openssl-${{ matrix.TARGET }}-cache" >> $GITHUB_OUTPUT
 
       - name: Restore OpenSSL cache
-        if: endsWith(matrix.TARGET, '_AES')
+        if: runner.os == 'windows'
         id: cache-openssl
         uses: actions/cache@v5
         with:
@@ -237,7 +237,7 @@ jobs:
           gccpath: /opt/musl_gcc
 
       - name: Build Windows OpenSSL
-        if: steps.cache-openssl.outputs.cache-hit != 'true' && runner.os == 'windows' && endsWith(matrix.TARGET, '_AES')
+        if: steps.cache-openssl.outputs.cache-hit != 'true' && runner.os == 'windows'
         shell: cmd
         run: |
           git clone --depth 1 --branch OpenSSL_1_1_1-stable https://github.com/openssl/openssl openssl-src
@@ -277,7 +277,7 @@ jobs:
         run: |
           mkdir build
           cd build
-          $AES_FLAGS = "-DN2N_OPTION_AES=OFF -DBCRYPT_LIBRARY=bcrypt.lib"
+          $AES_FLAGS = "-DN2N_OPTION_AES=OFF -DUSE_OPENSSL=1 -DBCRYPT_LIBRARY=bcrypt.lib"
           cmake .. `
             -G "NMake Makefiles" `
             -DCMAKE_BUILD_TYPE=Release `
