@@ -1173,10 +1173,13 @@ static void advance_punch_phase( n2n_edge_t * eee, struct peer_info * peer, time
     }
     if ( phase >= PUNCH_PHASE_DONE ) {
         /* All phases exhausted: move peer to known_peers for relay */
+        /* Only report if not already in relay mode (state change) */
+        if (!peer->punch_failed) {
+            traceEvent(TRACE_INFO, "PsP (supernode relay) for %s - all punch phases exhausted",
+                       PEER_ID(mac_tmp, peer));
+        }
         peer->punch_failed = 1;
         peer->punch_reset_time = now;
-        traceEvent(TRACE_NORMAL, "PsP (supernode relay) for %s - all punch phases exhausted",
-                   PEER_ID(mac_tmp, peer));
         /* Move from pending_peers to known_peers so find_peer_destination can find it */
         if ( eee->pending_peers == peer ) {
             eee->pending_peers = peer->next;
@@ -1403,12 +1406,12 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
                 scan->keepalive_fails++;
                 scan->last_probe_sent = 0;
 
-                traceEvent(TRACE_NORMAL, "Keepalive PROBE no reply from %s (fail %u/%u)",
+                traceEvent(TRACE_INFO, "Keepalive PROBE no reply from %s (fail %u/%u)",
                            PEER_ID(mac_tmp, scan),
                            scan->keepalive_fails, KEEPALIVE_MAX_FAILS);
 
                 if ( scan->keepalive_fails >= KEEPALIVE_MAX_FAILS ) {
-                    traceEvent(TRACE_NORMAL, "Keepalive: peer %s unreachable, moving to pending for re-punch",
+                    traceEvent(TRACE_INFO, "Keepalive: peer %s unreachable, moving to pending for re-punch",
                                PEER_ID(mac_tmp, scan));
                     /* Remove from known_peers */
                     if ( prev ) prev->next = next;
@@ -1612,13 +1615,15 @@ void set_peer_operational( n2n_edge_t * eee,
     }
 
     if ( scan ) {
-        /* Remove scan from pending_peers. */
+        /* Check if this is a state change (from pending or from relay) */
+        int is_state_change = scan->punch_failed; /* was using relay, now direct */
+        
+        /* Remove scan from pending_peers */
         if ( prev ) {
             prev->next = scan->next;
         } else {
             eee->pending_peers = scan->next;
         }
-
         /* Add scan to known_peers. */
         scan->next = eee->known_peers;
         eee->known_peers = scan;
@@ -1631,14 +1636,16 @@ void set_peer_operational( n2n_edge_t * eee,
         scan->last_seen = n2n_now();
         scan->punch_start_time = 0;  /* stop punch activity */
         scan->punch_failed = 0;
-        scan->first_seen   = 0; /* reset so first real packet triggers log */
+        scan->last_was_relay = 0; /* now using direct P2P */
+        scan->first_seen = 1; /* mark as seen */
 
-        /* Use the actual confirmed address for logging and REGISTER reply */
-        const n2n_sock_t *confirmed = (peer->family == AF_INET6) ? &scan->sock6 : &scan->sock;
-
-        traceEvent( TRACE_NORMAL, "P2P established with %s at %s",
-                    PEER_ID(mac_buf, scan),
-                    sock_to_cstr( sockbuf, confirmed ) );
+        /* Report P2P established only on state change (from relay to direct) */
+        if (is_state_change) {
+            const n2n_sock_t *confirmed = (peer->family == AF_INET6) ? &scan->sock6 : &scan->sock;
+            traceEvent( TRACE_NORMAL, "P2P established with %s at %s",
+                        PEER_ID(mac_buf, scan),
+                        sock_to_cstr( sockbuf, confirmed ) );
+        }
 
         /* Send unicast gratuitous ARP so peer updates its ARP table immediately */
         {
@@ -2204,21 +2211,27 @@ static int handle_PACKET( n2n_edge_t * eee,
                     if ( !sp ) sp = find_peer_by_mac(eee->pending_peers, pkt->srcMac);
                     if ( sp && sp->assigned_ip == 0 )
                         sp->assigned_ip = ntohl(src_ip);
-                    /* Log first real packet - direct P2P or supernode relay */
-                    if ( sp && !sp->first_seen ) {
-                        sp->first_seen = 1;
-                        char vip[INET_ADDRSTRLEN] = "-";
-                        if (sp->assigned_ip) {
-                            struct in_addr a;
-                            a.s_addr = htonl(sp->assigned_ip);
-                            inet_ntop(AF_INET, &a, vip, sizeof(vip));
+                    /* Log P2P/PsP status change only */
+                    if ( sp ) {
+                        int now_relay = from_supernode;
+                        int was_relay = sp->last_was_relay;
+                        /* Report only when state changes between P2P and PsP */
+                        if (!sp->first_seen || (now_relay != was_relay)) {
+                            sp->first_seen = 1;
+                            sp->last_was_relay = now_relay;
+                            char vip[INET_ADDRSTRLEN] = "-";
+                            if (sp->assigned_ip) {
+                                struct in_addr a;
+                                a.s_addr = htonl(sp->assigned_ip);
+                                inet_ntop(AF_INET, &a, vip, sizeof(vip));
+                            }
+                            n2n_sock_str_t sockbuf;
+                            if (now_relay)
+                                traceEvent(TRACE_NORMAL, "PsP relay with %s via supernode", vip);
+                            else
+                                traceEvent(TRACE_NORMAL, "P2P direct with %s at %s",
+                                           vip, sock_to_cstr(sockbuf, orig_sender));
                         }
-                        n2n_sock_str_t sockbuf;
-                        if (from_supernode)
-                            traceEvent(TRACE_NORMAL, "PsP relay with %s via supernode", vip);
-                        else
-                            traceEvent(TRACE_NORMAL, "P2P direct with %s at %s",
-                                       vip, sock_to_cstr(sockbuf, orig_sender));
                     }
                     PEERS_UNLOCK(eee);
                 }
@@ -2532,11 +2545,18 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
     if ( recvlen < 0 )
     {
 #ifdef _WIN32
-        W32_ERROR(WSAGetLastError(), c)
-        traceEvent( TRACE_ERROR, "recvfrom failed with %ls", c );
-        W32_ERROR_FREE(c)
+        int wsa_err = WSAGetLastError();
+        /* WSAECONNRESET (10054) and WSAENETRESET (10052) are common when
+         * sending to unreachable peers - not a real error, just ICMP feedback. */
+        if (wsa_err == 10054 || wsa_err == 10052) {
+            /* Silently ignore - this is normal ICMP port unreachable feedback */
+        } else {
+            W32_ERROR(wsa_err, c)
+            traceEvent( TRACE_WARNING, "recvfrom failed (%d): %ls", wsa_err, c );
+            W32_ERROR_FREE(c)
+        }
 #else
-        traceEvent(TRACE_ERROR, "recvfrom failed with %s", strerror(errno) );
+        traceEvent(TRACE_WARNING, "recvfrom failed: %s", strerror(errno) );
 #endif
 
         return; /* failed to receive data from UDP */
