@@ -873,7 +873,7 @@ static void set_localip( n2n_edge_t * eee )
                                 continue;
                             }
                             /* Skip virtual interfaces (VPN, etc.) - check interface type */
-                            if (pCurrAddresses->IfType == IF_TYPE_PPP || 
+                            if (pCurrAddresses->IfType == IF_TYPE_PPP ||
                                 pCurrAddresses->IfType == IF_TYPE_TUNNEL) {
                                 pUnicast = pUnicast->Next;
                                 continue;
@@ -908,7 +908,7 @@ static void set_localip( n2n_edge_t * eee )
             /* Skip interfaces without broadcast (point-to-point, VPN) */
             if (!(ifa->ifa_flags & IFF_BROADCAST))
                 continue;
-            
+
             struct sockaddr_in *pAddr = (struct sockaddr_in *)ifa->ifa_addr;
             uint32_t addr_ip = ntohl(pAddr->sin_addr.s_addr);
             int is_private = ((addr_ip >> 24) == 10) ||
@@ -930,7 +930,7 @@ static void set_localip( n2n_edge_t * eee )
     }
 #endif
     if (eee->local_socks_count > 0)
-        traceEvent(TRACE_NORMAL, "Found %d additional local IP(s) for LAN direct", eee->local_socks_count);
+        traceEvent(TRACE_NORMAL, "Found %d additional local IP(s)", eee->local_socks_count);
 }
 
 /** Send a QUERY_PEER packet to supernode asking for target's address. */
@@ -1215,10 +1215,10 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
 
     peer->punch_start_time = n2n_now();
     peer->last_punch_probe = peer->punch_start_time;
-    
+
     traceEvent(TRACE_INFO, "hole-punch started for %s -> %s",
                PEER_ID(mac_tmp, peer), sock_to_cstr((n2n_sock_str_t){0}, &peer->sock));
-    
+
     /* Send probe for both IPv4 and IPv6 */
     if (peer->sock.family == AF_INET && eee->udp_sock != -1)
         send_probe(eee, &peer->sock, peer->mac_addr);
@@ -1233,10 +1233,10 @@ static void check_punch_timeouts( n2n_edge_t * eee, time_t now )
     struct peer_info * scan = eee->pending_peers;
     struct peer_info * prev = NULL;
     MACSTR_TMP(mac_tmp);
-    
+
     while ( scan ) {
         struct peer_info * next = scan->next;  /* Save next before potential move */
-        
+
         if ( scan->sock_lan.family != 0 && scan->sock_lan.port != 0 &&
              !scan->lan_punch_done &&
              scan->lan_punch_start != 0 )
@@ -1339,7 +1339,7 @@ static void check_keepalive( n2n_edge_t * eee, time_t now )
             scan->punch_failed = 1;  /* Mark as relay mode so keepalive is sent */
         }
 
-        /* For peers using relay (punch_failed=1), send QUERY_PEER to 
+        /* For peers using relay (punch_failed=1), send QUERY_PEER to
          * maintain relay path and trigger punch retry */
         if ( scan->punch_failed ) {
             if ( idle >= KEEPALIVE_IDLE_SECONDS ) {
@@ -1663,7 +1663,7 @@ void set_peer_operational( n2n_edge_t * eee,
     if ( scan ) {
         /* Check if this is a state change (from pending or from relay) */
         int is_state_change = scan->punch_failed; /* was using relay, now direct */
-        
+
         /* Remove scan from pending_peers */
         if ( prev ) {
             prev->next = scan->next;
@@ -1863,7 +1863,7 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         n2n_sock_t old_sn_alt;
         memcpy(&old_sn, &(eee->supernode), sizeof(n2n_sock_t));
         memcpy(&old_sn_alt, &(eee->supernode_alt), sizeof(n2n_sock_t));
-        
+
         /* Quiet mode if we already have a valid address - don't spam warnings */
         int quiet = (old_sn.family != 0);
         supernode2addr(&(eee->supernode), eee->sn_af, eee->sn_ip_array[eee->sn_idx], quiet);
@@ -1873,7 +1873,7 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
             if (supernode2addr(&eee->supernode_alt, alt_af, eee->sn_ip_array[eee->sn_idx], 1) != 0)
                 memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
         }
-        
+
         if (memcmp(&old_sn, &(eee->supernode), sizeof(n2n_sock_t)) != 0 ||
             memcmp(&old_sn_alt, &(eee->supernode_alt), sizeof(n2n_sock_t)) != 0)
         {
@@ -2766,7 +2766,7 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
                 PEERS_LOCK(eee);
                 struct peer_info *scan = find_peer_by_mac(eee->known_peers, reg.srcMac);
                 struct peer_info *pending = find_peer_by_mac(eee->pending_peers, reg.srcMac);
-                
+
                 if (lan_possible && !from_supernode) {
                     if (pending && peer_add_lan_sock(pending, &lan_sock)) {
                         n2n_sock_str_t sbuf;
@@ -2782,7 +2782,7 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
                                    scan->sock_lans_count);
                     }
                 }
-                
+
                 if (NULL == scan && NULL == pending) {
                     if (lan_possible) {
                         traceEvent(TRACE_INFO, "Rx REGISTER with LAN addr %s - trying LAN direct",
@@ -3003,13 +3003,13 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
             } else {
                 /* Peer already in known_peers - check for address changes */
                 int addr_changed = 0;
-                
+
                 /* Check public address change */
                 if (is_valid_peer_sock(&pi.sockets[0]) &&
                     sock_equal(&known->sock, &pi.sockets[0]) != 0) {
                     addr_changed = 1;
                 }
-                
+
                 /* For same-NAT peers, also check LAN address/port change */
                 if (!addr_changed &&
                     eee->my_public_sock.family == AF_INET &&
@@ -3028,7 +3028,7 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
                         }
                     }
                 }
-                
+
                 if (addr_changed) {
                     /* Address changed: move to pending_peers and restart punch */
                     traceEvent(TRACE_INFO, "Peer %s addr changed via PEER_INFO, moving to pending",
@@ -3147,7 +3147,8 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
                             else
                                 caps_str = "unknown (old supernode)";
                             traceEvent(TRACE_NORMAL, "Supernode support: %s", caps_str);
-                            traceEvent(TRACE_NORMAL, "[OK] Edge Peer <<< =======64======= >>> Super Node");
+                            traceEvent(TRACE_NORMAL, "[OK] edge <<< ======= %s ======= >>> supernode",
+                                       eee->supernode.family == AF_INET6 ? "IPv6" : "IPv4");
                             first_ok_message_shown = 1;
                         } else {
                             traceEvent(TRACE_DEBUG, "[OK] Edge Peer <<< =======64======= >>> Super Node");
@@ -3333,7 +3334,7 @@ static int query_dns_record(const char *domain, uint16_t qtype, char *result, si
     static uint16_t cached_qtype = 0;
     static time_t cache_time = 0;
     time_t now = time(NULL);
-    
+
     if (strcmp(domain, cached_domain) == 0 && cached_qtype == qtype && (now - cache_time) < 5 && cached_result[0] != '\0') {
         strncpy(result, cached_result, result_size - 1);
         result[result_size - 1] = '\0';
@@ -3355,7 +3356,7 @@ static int query_dns_record(const char *domain, uint16_t qtype, char *result, si
         memset(&dns_addr, 0, sizeof(dns_addr));
         dns_addr.sin_family = AF_INET;
         dns_addr.sin_port = htons(53);
-        
+
 #ifdef _WIN32
         dns_addr.sin_addr.s_addr = inet_addr(dns_servers[i]);
 #else
@@ -3518,7 +3519,7 @@ static int supernode2addr(n2n_sock_t * sn, int af, const n2n_sn_name_t addrIn, i
         if (err != 1) {
             char ip_str[INET6_ADDRSTRLEN];
             uint16_t qtype = (af == AF_INET6) ? 0x1C : 0x01;
-            
+
             if (query_dns_record(addr, qtype, ip_str, sizeof(ip_str)) == 0) {
                 if (qtype == 0x01) {
                     inet_pton(AF_INET, ip_str, &sn->addr.v4);
@@ -4107,14 +4108,14 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         exit(1);
     }
 
-    traceEvent( TRACE_NORMAL, "Starting n2n edge %s %s", n2n_sw_version, n2n_sw_buildDate );
+    traceEvent( TRACE_NORMAL, "Starting edge %s %s", n2n_sw_version, n2n_sw_buildDate );
 
     for (int i = 0; i< eee.sn_num; ++i) {
         /* Skip the default supernode (last one if it matches default) */
         if (strcmp(eee.sn_ip_array[i], "ouno.eu.org:10084") == 0) {
             continue; // Skip displaying default
         }
-        traceEvent( TRACE_NORMAL, "supernode %u => %s\n", i, (eee.sn_ip_array[i]) );
+        traceEvent( TRACE_NORMAL, "Supernode %u => %s\n", i, (eee.sn_ip_array[i]) );
     }
 
     while (supernode2addr( &(eee.supernode), eee.sn_af, eee.sn_ip_array[eee.sn_idx], 0 ) != 0) {
@@ -4343,12 +4344,11 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
         }
 
         if (has_ipv4 && has_ipv6)
-            traceEvent(TRACE_NORMAL, "Dual-stack: IPv4+IPv6 sockets ready (supernode via %s)",
-                       eee.supernode.family == AF_INET6 ? "IPv6" : "IPv4");
+            traceEvent(TRACE_NORMAL, "Edge support: IPv4+IPv6 (dual-stack)");
         else if (has_ipv6)
-            traceEvent(TRACE_NORMAL, "Only IPv6 socket ready");
+            traceEvent(TRACE_NORMAL, "Edge support: IPv6 only");
         else
-            traceEvent(TRACE_NORMAL, "Only IPv4 socket ready");
+            traceEvent(TRACE_NORMAL, "Edge support: IPv4 only");
 
         if (eee.udp_sock6 == -1)
             traceEvent(TRACE_WARNING, "IPv6 UDP socket unavailable, IPv6 peers will use relay only");
@@ -4382,7 +4382,9 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
     }
 #endif
 
-    traceEvent(TRACE_NORMAL, "edge started");
+    if (eee.mgmt_sock >= 0) {
+        traceEvent(TRACE_NORMAL, "Management interface on port %u", (unsigned int) mgmt_port);
+    }
 
     /* Attempt UPnP/NAT-PMP port mapping so external peers can reach us.
      * This is compiled in by default and runs automatically at startup.
