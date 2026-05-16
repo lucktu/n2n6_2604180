@@ -221,10 +221,11 @@ struct peer_info {
     struct peer_info *  next;
     n2n_community_t     community_name;
     n2n_mac_t           mac_addr;
-    n2n_sock_t          sock;              /* primary (public) address */
+    n2n_sock_t          sock;              /* IPv4 public address (family=0 if unavailable) */
     n2n_sock_t          sock6;             /* IPv6 public address (family=0 if unavailable) */
     int                 num_sockets;       /* 1=public only, 2=public+LAN */
-    n2n_sock_t          sockets[2];        /* [0]=public, [1]=LAN */
+    n2n_sock_t          sockets[2];        /* [0]=public (primary), [1]=LAN */
+    uint8_t             connect_family;    /* AF_INET or AF_INET6 - how edge connected to supernode */
     time_t              last_seen;
     char                version[8];
     char                os_name[16];
@@ -246,6 +247,7 @@ struct peer_info {
     uint8_t             temp_local_sock_valid; /* 1 if temp_local_sock is valid */
     uint8_t             psp_logged;        /* 1 if PsP message already printed for current state */
     uint8_t             p2p_logged;        /* 1 if P2P direct message already printed for current state */
+    uint8_t             same_lan_as_sn;    /* 1 if edge is in same LAN as supernode */
 };
 
 struct n2n_edge; /* defined in edge.c */

@@ -521,6 +521,15 @@ static void purge_expired_community_stats(n2n_sn_t *sss, time_t *p_last_purge, t
     }
 }
 
+static int is_private_ipv4(const uint8_t addr[IPV4_SIZE])
+{
+    if (addr[0] == 10) return 1;
+    if (addr[0] == 172 && (addr[1] & 0xF0) == 16) return 1;
+    if (addr[0] == 192 && addr[1] == 168) return 1;
+    if (addr[0] == 127) return 1;
+    return 0;
+}
+
 static int update_edge( n2n_sn_t * sss,
                         const n2n_mac_t edgeMac,
                         const n2n_community_t community,
@@ -701,6 +710,8 @@ static int update_edge( n2n_sn_t * sss,
             scan->assigned_ip = assigned_ip;
         }
 
+        scan->connect_family = sender_sock->family;
+
         memcpy(scan->community_name, community, sizeof(n2n_community_t) );
         memcpy(&(scan->mac_addr), edgeMac, sizeof(n2n_mac_t));
         
@@ -711,6 +722,16 @@ static int update_edge( n2n_sn_t * sss,
         } else {
             memcpy(&(scan->sock), sender_sock, sizeof(n2n_sock_t));
             /* sock6 remains 0 from calloc */
+        }
+
+        /* Check if edge is in same LAN as supernode:
+         * local_sock IP == sender_sock IP and both are private */
+        if (local_sock_ena && local_sock &&
+            sender_sock->family == AF_INET && local_sock->family == AF_INET &&
+            memcmp(sender_sock->addr.v4, local_sock->addr.v4, IPV4_SIZE) == 0 &&
+            is_private_ipv4(sender_sock->addr.v4))
+        {
+            scan->same_lan_as_sn = 1;
         }
 
         if (version) {
@@ -730,14 +751,14 @@ static int update_edge( n2n_sn_t * sss,
         scan->next = sss->edges;
         sss->edges = scan;
 
-        /* Build sockets array for hole-punching */
-        /* For dual-stack: sockets[0] = IPv4 (if available), sock6 = IPv6 (if available) */
-        /* This allows edges to try both addresses in parallel */
+        /* Build sockets array for hole-punching.
+        * sockets[0] = primary (connect_family), sock6 = IPv6 (if available) */
         scan->num_sockets = 0;
-        if (scan->sock.family == AF_INET) {
+        if (scan->connect_family == AF_INET6 && scan->sock6.family == AF_INET6) {
+            scan->sockets[scan->num_sockets++] = scan->sock6;
+        } else if (scan->sock.family == AF_INET) {
             scan->sockets[scan->num_sockets++] = scan->sock;
         } else if (scan->sock6.family == AF_INET6) {
-            /* IPv6-only: put IPv6 in sockets[0] */
             scan->sockets[scan->num_sockets++] = scan->sock6;
         }
         if (local_sock_ena && local_sock) {
@@ -777,22 +798,44 @@ static int update_edge( n2n_sn_t * sss,
         
         if ( (0 != memcmp(community, scan->community_name, sizeof(n2n_community_t))) || addr_changed )
         {
-            /* Alt-family registration: only update the other-family address, don't overwrite primary */
-            if (scan->sock.family != 0 && sender_sock->family != scan->sock.family) {
+            /* Determine existing primary family (backward compat: old data may not have connect_family) */
+            int existing_family = scan->connect_family;
+            if (existing_family == 0) {
+                if (scan->sock.family != 0)
+                    existing_family = AF_INET;
+                else if (scan->sock6.family != 0)
+                    existing_family = AF_INET6;
+            }
+
+            /* Alt-family registration: update address and switch primary family.
+             * This handles both dual-stack registration and restart-on-different-family. */
+            if (existing_family != 0 && sender_sock->family != existing_family) {
                 if (sender_sock->family == AF_INET6) {
                     int had_sock6 = (scan->sock6.family == AF_INET6);
                     memcpy(&scan->sock6, sender_sock, sizeof(n2n_sock_t));
+                    scan->connect_family = AF_INET6;
+                    scan->num_sockets = 0;
+                    scan->sockets[scan->num_sockets++] = scan->sock6;
+                    if (local_sock_ena && local_sock) {
+                        scan->sockets[scan->num_sockets++] = *local_sock;
+                    }
                     scan->last_seen = now;
-                    /* If sock6 was newly learned, return 1 so peers get a fresh PEER_INFO
-                     * that includes the IPv6 address. */
                     return had_sock6 ? 0 : 1;
                 }
-                /* IPv4 alt: primary sock already has IPv4 from main registration */
+                /* IPv4 alt: primary was IPv6, switch to IPv4 */
+                memcpy(&scan->sock, sender_sock, sizeof(n2n_sock_t));
+                scan->connect_family = AF_INET;
+                scan->num_sockets = 0;
+                scan->sockets[scan->num_sockets++] = scan->sock;
+                if (local_sock_ena && local_sock) {
+                    scan->sockets[scan->num_sockets++] = *local_sock;
+                }
                 scan->last_seen = now;
-                return 0;
+                return 1;
             }
 
             memcpy(scan->community_name, community, sizeof(n2n_community_t) );
+            scan->connect_family = sender_sock->family;
             
             /* Store address in the correct slot based on family */
             if (sender_sock->family == AF_INET6) {
@@ -801,6 +844,15 @@ static int update_edge( n2n_sn_t * sss,
             } else {
                 memcpy(&(scan->sock), sender_sock, sizeof(n2n_sock_t));
                 /* Don't clear sock6 - it may have IPv6 from earlier registration */
+            }
+
+            /* Check if edge is in same LAN as supernode */
+            if (local_sock_ena && local_sock &&
+                sender_sock->family == AF_INET && local_sock->family == AF_INET &&
+                memcmp(sender_sock->addr.v4, local_sock->addr.v4, IPV4_SIZE) == 0 &&
+                is_private_ipv4(sender_sock->addr.v4))
+            {
+                scan->same_lan_as_sn = 1;
             }
 
             if (version) {
@@ -816,13 +868,14 @@ static int update_edge( n2n_sn_t * sss,
                         macaddr_str( mac_buf, edgeMac ),
                         sock_to_cstr( sockbuf, sender_sock ) );
 
-            /* Build sockets array for hole-punching */
-            /* For dual-stack: sockets[0] = IPv4 (if available), sock6 = IPv6 (if available) */
+            /* Build sockets array for hole-punching.
+            * sockets[0] = primary (connect_family), sock6 = IPv6 (if available) */
             scan->num_sockets = 0;
-            if (scan->sock.family == AF_INET) {
+            if (scan->connect_family == AF_INET6 && scan->sock6.family == AF_INET6) {
+                scan->sockets[scan->num_sockets++] = scan->sock6;
+            } else if (scan->sock.family == AF_INET) {
                 scan->sockets[scan->num_sockets++] = scan->sock;
             } else if (scan->sock6.family == AF_INET6) {
-                /* IPv6-only: put IPv6 in sockets[0] */
                 scan->sockets[scan->num_sockets++] = scan->sock6;
             }
             if (local_sock_ena && local_sock) {
@@ -930,14 +983,20 @@ static int try_forward( n2n_sn_t * sss,
     if ( NULL != scan )
     {
         ssize_t data_sent_len;
-        data_sent_len = sendto_sock( sss, &(scan->sock), pktbuf, pktsize );
+        n2n_sock_t *primary = (scan->connect_family == AF_INET6 && scan->sock6.family == AF_INET6)
+                              ? &scan->sock6 : &scan->sock;
+        n2n_sock_t *fallback = (primary == &scan->sock6) ? &scan->sock : &scan->sock6;
+
+        data_sent_len = sendto_sock( sss, primary, pktbuf, pktsize );
+        if (data_sent_len != pktsize && fallback->family != 0)
+            data_sent_len = sendto_sock( sss, fallback, pktbuf, pktsize );
 
         if ( data_sent_len == pktsize )
         {
             ++(sss->stats.fwd);
             traceEvent(TRACE_DEBUG, "unicast %lu to [%s] %s",
                        pktsize,
-                       sock_to_cstr( sockbuf, &(scan->sock) ),
+                       sock_to_cstr( sockbuf, primary ),
                        macaddr_str(mac_buf, scan->mac_addr));
         }
         else
@@ -945,7 +1004,7 @@ static int try_forward( n2n_sn_t * sss,
             ++(sss->stats.errors);
             traceEvent(TRACE_ERROR, "unicast %lu to [%s] %s FAILED (%d: %s)",
                        pktsize,
-                       sock_to_cstr( sockbuf, &(scan->sock) ),
+                       sock_to_cstr( sockbuf, primary ),
                        macaddr_str(mac_buf, scan->mac_addr),
 #ifdef _WIN32
                        WSAGetLastError(), "socket error"
@@ -1077,7 +1136,6 @@ static int process_mgmt( n2n_sn_t * sss,
             }
 
             macstr_t mac_buf;
-            n2n_sock_str_t sock_buf;
             const char *version = (edge->version[0] != '\0') ? edge->version : "unknown";
             const char *os_name = (edge->os_name[0] != '\0') ? edge->os_name : "unknown";
 
@@ -1105,14 +1163,28 @@ static int process_mgmt( n2n_sn_t * sss,
             if (edge->assigned_ip != 0)
                 snprintf(virt_ip, sizeof(virt_ip), "%s", inet_ntoa(a));
 
-            ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
-                               "  %2u  %-17s  %-15s  %-47s  %-7s  %s\n",
-                               id++,
-                               macaddr_str(mac_buf, edge->mac_addr),
-                               virt_ip,
-                               sock_to_cstr(sock_buf, &edge->sock),
-                               version,
-                               os_name);
+            {
+                char wan_buf[72];
+                n2n_sock_str_t addr_str;
+                n2n_sock_t *primary_sock;
+
+                if (edge->connect_family == AF_INET6 && edge->sock6.family == AF_INET6) {
+                    primary_sock = &edge->sock6;
+                } else {
+                    primary_sock = &edge->sock;
+                }
+                snprintf(wan_buf, sizeof(wan_buf), "%s",
+                         sock_to_cstr(addr_str, primary_sock));
+
+                ressize = snprintf(resbuf, N2N_SN_PKTBUF_SIZE,
+                                   "  %2u  %-17s  %-15s  %-47s  %-7s  %s\n",
+                                   id++,
+                                   macaddr_str(mac_buf, edge->mac_addr),
+                                   virt_ip,
+                                   wan_buf,
+                                   version,
+                                   os_name);
+            }
 
             r = sendto(sss->mgmt_sock, resbuf, ressize, 0, sender_sock, sender_sock_len);
             if (r <= 0) return -1;
@@ -1274,20 +1346,37 @@ static int try_broadcast( n2n_sn_t * sss,
         {
             ssize_t data_sent_len;
 
-            data_sent_len = sendto_sock(sss, &(scan->sock), pktbuf, pktsize);
-
-            if(data_sent_len != pktsize)
-            {
-                ++(sss->stats.errors);
-                /* Error handling code... */
+            if (scan->sock.family != 0) {
+                data_sent_len = sendto_sock(sss, &(scan->sock), pktbuf, pktsize);
+                if(data_sent_len != pktsize)
+                {
+                    ++(sss->stats.errors);
+                }
+                else
+                {
+                    ++(sss->stats.broadcast);
+                    traceEvent(TRACE_DEBUG, "multicast %lu to %s %s",
+                               pktsize,
+                               sock_to_cstr( sockbuf, &(scan->sock) ),
+                               macaddr_str( mac_buf, scan->mac_addr));
+                }
             }
-            else
+
+            if (scan->sock6.family != 0)
             {
-                ++(sss->stats.broadcast);
-                traceEvent(TRACE_DEBUG, "multicast %lu to %s %s",
-                           pktsize,
-                           sock_to_cstr( sockbuf, &(scan->sock) ),
-                           macaddr_str( mac_buf, scan->mac_addr));
+                data_sent_len = sendto_sock(sss, &(scan->sock6), pktbuf, pktsize);
+                if(data_sent_len != pktsize)
+                {
+                    ++(sss->stats.errors);
+                }
+                else
+                {
+                    ++(sss->stats.broadcast);
+                    traceEvent(TRACE_DEBUG, "multicast %lu to %s %s",
+                               pktsize,
+                               sock_to_cstr( sockbuf, &(scan->sock6) ),
+                               macaddr_str( mac_buf, scan->mac_addr));
+                }
             }
         }
 
@@ -1556,12 +1645,19 @@ static int process_udp( n2n_sn_t * sss,
                 target->sockets[1].family != 0 &&
                 target->sockets[1].port != 0)
                 pi.aflags |= N2N_AFLAGS_LOCAL_SOCKET;
-            pi.sockets[0] = target->sockets[0];
+            /* Always put IPv4 in sockets[0] if available, so both addresses are carried */
+            if (target->sock.family == AF_INET)
+                pi.sockets[0] = target->sock;
+            else if (target->sock6.family == AF_INET6)
+                pi.sockets[0] = target->sock6;
             if (pi.aflags & N2N_AFLAGS_LOCAL_SOCKET)
                 pi.sockets[1] = target->sockets[1];
             if (target->sock6.family == AF_INET6) {
                 pi.aflags |= N2N_AFLAGS_IPV6_SOCKET;
                 pi.sock6 = target->sock6;
+            }
+            if (target->same_lan_as_sn) {
+                pi.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
             }
 
             encode_PEER_INFO( encbuf, &encx, &cmn2, &pi );
@@ -1594,12 +1690,19 @@ static int process_udp( n2n_sn_t * sss,
                     requester->sockets[1].family != 0 &&
                     requester->sockets[1].port != 0)
                     pi2.aflags |= N2N_AFLAGS_LOCAL_SOCKET;
-                pi2.sockets[0] = requester->sockets[0];
+                /* Always put IPv4 in sockets[0] if available */
+                if (requester->sock.family == AF_INET)
+                    pi2.sockets[0] = requester->sock;
+                else if (requester->sock6.family == AF_INET6)
+                    pi2.sockets[0] = requester->sock6;
                 if (pi2.aflags & N2N_AFLAGS_LOCAL_SOCKET)
                     pi2.sockets[1] = requester->sockets[1];
                 if (requester->sock6.family == AF_INET6) {
                     pi2.aflags |= N2N_AFLAGS_IPV6_SOCKET;
                     pi2.sock6 = requester->sock6;
+                }
+                if (requester->same_lan_as_sn) {
+                    pi2.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
                 }
 
                 encode_PEER_INFO( encbuf2, &encx2, &cmn3, &pi2 );
@@ -1717,23 +1820,6 @@ static int process_udp( n2n_sn_t * sss,
             size_t          pix;
             struct peer_info *p = sss->edges;
 
-            n2n_common_t    a_cmn;
-            n2n_PEER_INFO_t a_pi;
-            uint8_t         a_pibuf[N2N_SN_PKTBUF_SIZE];
-            size_t          a_pix;
-
-            memset(&a_cmn, 0, sizeof(a_cmn));
-            a_cmn.ttl   = N2N_DEFAULT_TTL;
-            a_cmn.pc    = n2n_peer_info;
-            a_cmn.flags = N2N_FLAGS_FROM_SUPERNODE;
-            memcpy(a_cmn.community, cmn.community, sizeof(n2n_community_t));
-
-            memcpy(a_pi.mac, reg.edgeMac, N2N_MAC_SIZE);
-            a_pi.sockets[0] = ack.sock;
-            a_pi.aflags = 0;
-            a_pix = 0;
-            encode_PEER_INFO(a_pibuf, &a_pix, &a_cmn, &a_pi);
-
             memset(&pi_cmn, 0, sizeof(pi_cmn));
             pi_cmn.ttl   = N2N_DEFAULT_TTL;
             pi_cmn.pc    = n2n_peer_info;
@@ -1745,7 +1831,11 @@ static int process_udp( n2n_sn_t * sss,
                     memcmp(p->mac_addr, reg.edgeMac, N2N_MAC_SIZE) != 0)
                 {
                     memcpy(pi.mac, p->mac_addr, N2N_MAC_SIZE);
-                    pi.sockets[0] = p->sockets[0];
+                    /* Always put IPv4 in sockets[0] if available */
+                    if (p->sock.family == AF_INET)
+                        pi.sockets[0] = p->sock;
+                    else if (p->sock6.family == AF_INET6)
+                        pi.sockets[0] = p->sock6;
                     if (p->num_sockets > 1 &&
                         p->sockets[1].family != 0 &&
                         p->sockets[1].port != 0)
@@ -1762,6 +1852,9 @@ static int process_udp( n2n_sn_t * sss,
                     } else {
                         memset(&pi.sock6, 0, sizeof(n2n_sock_t));
                     }
+                    if (p->same_lan_as_sn) {
+                        pi.aflags |= N2N_AFLAGS_SAME_LAN_AS_SN;
+                    }
                     /* Include version and os_name so edge can display them */
                     strncpy(pi.version, p->version, sizeof(pi.version) - 1);
                     strncpy(pi.os_name, p->os_name, sizeof(pi.os_name) - 1);
@@ -1772,36 +1865,6 @@ static int process_udp( n2n_sn_t * sss,
                     traceEvent(TRACE_DEBUG, "pushed PEER_INFO %s to new edge %s",
                                macaddr_str(mac_buf, p->mac_addr),
                                macaddr_str(mac_buf2, reg.edgeMac));
-
-                    /* Push new edge's info to all existing peers so they can update their records.
-                     * No PUNCH_REQUEST flag - peers just save the info, don't start punching. */
-                    {
-                        struct sockaddr_storage peer_sa;
-                        socklen_t peer_sa_len;
-                        SOCKET peer_sock;
-
-                        if (p->sock.family == AF_INET6) {
-                            struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&peer_sa;
-                            memset(sa6, 0, sizeof(*sa6));
-                            sa6->sin6_family = AF_INET6;
-                            sa6->sin6_port   = htons(p->sock.port);
-                            memcpy(&sa6->sin6_addr, p->sock.addr.v6, IPV6_SIZE);
-                            peer_sa_len = sizeof(struct sockaddr_in6);
-                            peer_sock   = sss->sock6;
-                        } else {
-                            struct sockaddr_in *sa4 = (struct sockaddr_in *)&peer_sa;
-                            memset(sa4, 0, sizeof(*sa4));
-                            sa4->sin_family = AF_INET;
-                            sa4->sin_port   = htons(p->sock.port);
-                            memcpy(&sa4->sin_addr, p->sock.addr.v4, IPV4_SIZE);
-                            peer_sa_len = sizeof(struct sockaddr_in);
-                            peer_sock   = sss->sock;
-                        }
-                        sendto(peer_sock, a_pibuf, a_pix, 0,
-                               (struct sockaddr *)&peer_sa, peer_sa_len);
-                        traceEvent(TRACE_DEBUG, "pushed A's new addr to peer %s (simultaneous open)",
-                                   macaddr_str(mac_buf, p->mac_addr));
-                    }
                 }
                 p = p->next;
             }

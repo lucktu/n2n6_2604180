@@ -1332,18 +1332,28 @@ static void start_punch( n2n_edge_t * eee, struct peer_info * peer )
     if ( peer->punch_failed ) return;           /* already gave up */
     if ( peer->punch_start_time != 0 ) return;  /* already in progress */
 
+    int we_have_ipv4 = (eee->udp_sock != -1);
+    int we_have_ipv6 = (eee->udp_sock6 != -1);
+    int peer_has_ipv4 = (peer->sock.family == AF_INET);
+    int peer_has_ipv6 = (peer->sock6.family == AF_INET6);
+
+    /* Cross-protocol: no punch if protocols don't match */
+    if (!we_have_ipv4 && !we_have_ipv6) return;
+    if (peer_has_ipv4 && !we_have_ipv4 && !peer_has_ipv6) return;
+    if (peer_has_ipv6 && !we_have_ipv6 && !peer_has_ipv4) return;
+
     int punched = 0;
     
-    /* Try IPv4 punch if available */
-    if ( peer->sock.family == AF_INET ) {
+    /* Try IPv4 punch if both sides have IPv4 */
+    if ( peer_has_ipv4 && we_have_ipv4 ) {
         send_probe(eee, &peer->sock, peer->mac_addr);
         punched = 1;
         traceEvent(TRACE_INFO, "IPv4 hole-punch started for %s",
                    macaddr_str(mac_tmp, peer->mac_addr));
     }
     
-    /* Try IPv6 punch if available and we have IPv6 socket */
-    if ( peer->sock6.family == AF_INET6 && eee->udp_sock6 != -1 ) {
+    /* Try IPv6 punch if both sides have IPv6 */
+    if ( peer_has_ipv6 && we_have_ipv6 ) {
         send_probe(eee, &peer->sock6, peer->mac_addr);
         punched = 1;
         traceEvent(TRACE_INFO, "IPv6 hole-punch started for %s",
@@ -1910,9 +1920,8 @@ void set_peer_operational( n2n_edge_t * eee,
         if (!scan->p2p_logged) {
             char mac_buf[18];
             n2n_sock_str_t sockbuf;
-            traceEvent( TRACE_NORMAL, "P2P direct with %s at %s (%s)",
-                        PEER_ID(mac_buf, scan), sock_to_cstr( sockbuf, peer ),
-                        (peer->family == AF_INET6) ? "IPv6" : "IPv4" );
+            traceEvent( TRACE_NORMAL, "P2P direct with %s at %s",
+                        PEER_ID(mac_buf, scan), sock_to_cstr( sockbuf, peer ) );
             scan->p2p_logged = 1;
         }
 
@@ -2145,8 +2154,15 @@ static void update_supernode_reg( n2n_edge_t * eee, time_t nowTime )
         {
             supernode2addr(&(eee->supernode), eee->sn_af, eee->sn_ip_array[eee->sn_idx]);
             
-            /* Clear alternate address - it will be resolved naturally if domain has both A and AAAA */
-            memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
+            /* Re-resolve alternate address for dual-stack registration */
+            {
+                int alt_af = (eee->supernode.family == AF_INET6) ? AF_INET : AF_INET6;
+                int can_resolve = (alt_af == AF_INET6) ? (eee->udp_sock6 != -1) : (eee->udp_sock != -1);
+                memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
+                if (can_resolve) {
+                    supernode2addr(&eee->supernode_alt, alt_af, eee->sn_ip_array[eee->sn_idx]);
+                }
+            }
         }
     }
     else
@@ -2187,6 +2203,12 @@ static int find_peer_destination(n2n_edge_t * eee,
            !scan->punch_failed &&
            (memcmp(mac_address, scan->mac_addr, N2N_MAC_SIZE) == 0))
         {
+            /* If never had direct P2P communication, use relay (中转保底) */
+            if (scan->direct_seen == 0) {
+                traceEvent(TRACE_DEBUG, "find_peer_destination: no direct_seen yet, using relay");
+                break;
+            }
+
             /* If no direct P2P communication for 15s, fall back to relay */
             if (scan->direct_seen > 0 && (now - scan->direct_seen) >= 15) {
                 traceEvent(TRACE_DEBUG, "find_peer_destination: direct_seen timeout, using relay");
@@ -2555,7 +2577,53 @@ static int handle_PACKET( n2n_edge_t * eee,
             scan->last_seen = now;
         }
     } else {
-        update_peer_address(eee, from_supernode, pkt->srcMac, orig_sender, now);
+        /* Relayed packet from known peer.
+         * Check if sender's address changed - if so, move to pending
+         * for re-punch (中转保底: relay now, re-punch in background). */
+        int addr_changed = 0;
+        if (orig_sender->family == AF_INET) {
+            if (scan->sock.family == AF_INET) {
+                if (sock_equal(&scan->sock, orig_sender) != 0)
+                    addr_changed = 1;
+            } else {
+                addr_changed = 1;
+            }
+        } else if (orig_sender->family == AF_INET6) {
+            if (scan->sock6.family == AF_INET6) {
+                if (sock_equal(&scan->sock6, orig_sender) != 0)
+                    addr_changed = 1;
+            } else {
+                addr_changed = 1;
+            }
+        }
+
+        if (addr_changed) {
+            macstr_t mac_buf2;
+            traceEvent(TRACE_INFO, "Relayed packet: %s addr changed, move to pending for re-punch",
+                       macaddr_str(mac_buf2, pkt->srcMac));
+
+            struct peer_info *prev = NULL, *s = eee->known_peers;
+            while (s && s != scan) { prev = s; s = s->next; }
+            if (s) {
+                if (prev) prev->next = s->next;
+                else eee->known_peers = s->next;
+                s->next = eee->pending_peers;
+                eee->pending_peers = s;
+                s->punch_failed = 0;
+                s->punch_start_time = 0;
+                s->lan_punch_done = 0;
+                s->lan_punch_start = 0;
+                s->direct_seen = 0;
+                s->last_probe_sent = 0;
+                s->keepalive_fails = 0;
+                s->register_retry_count = 0;
+                s->psp_logged = 0;
+                s->p2p_logged = 0;
+                start_punch(eee, s);
+            }
+        } else {
+            scan->last_seen = now;
+        }
     }
     PEERS_UNLOCK(eee);
 
@@ -3162,6 +3230,20 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
                        sock_to_cstr(sockbuf1, &pi.sockets[0]),
                        do_punch ? " [PUNCH]" : "");
 
+            /* If peer is in same LAN as supernode, replace its private IP
+             * with supernode's public IP (keeping peer's port). */
+            if ((pi.aflags & N2N_AFLAGS_SAME_LAN_AS_SN) && eee->supernode.family != 0) {
+                if (pi.sockets[0].family == AF_INET) {
+                    if (eee->supernode.family == AF_INET) {
+                        memcpy(pi.sockets[0].addr.v4, eee->supernode.addr.v4, IPV4_SIZE);
+                    } else if (eee->supernode_alt.family == AF_INET) {
+                        memcpy(pi.sockets[0].addr.v4, eee->supernode_alt.addr.v4, IPV4_SIZE);
+                    }
+                    traceEvent(TRACE_INFO, "SAME_LAN_AS_SN: replaced IPv4 with SN IP %s",
+                               sock_to_cstr(sockbuf1, &pi.sockets[0]));
+                }
+            }
+
             PEERS_LOCK(eee);
             struct peer_info *known = find_peer_by_mac(eee->known_peers, pi.mac);
             struct peer_info *pending = find_peer_by_mac(eee->pending_peers, pi.mac);
@@ -3171,6 +3253,13 @@ static void readFromIPSocket( n2n_edge_t * eee, SOCKET fd )
                     int addr_changed = 0;
                     if (pi.sockets[0].family == AF_INET && known->sock.family == AF_INET) {
                         if (sock_equal(&known->sock, &pi.sockets[0]) != 0) {
+                            addr_changed = 1;
+                        }
+                    }
+                    if (!addr_changed &&
+                        (pi.aflags & N2N_AFLAGS_IPV6_SOCKET) && pi.sock6.family == AF_INET6 &&
+                        known->sock6.family == AF_INET6) {
+                        if (sock_equal(&known->sock6, &pi.sock6) != 0) {
                             addr_changed = 1;
                         }
                     }
@@ -3981,8 +4070,15 @@ static int check_supernode_domain_and_update(n2n_edge_t * eee, time_t now)
         eee->supernode = new_addr;
         eee->last_resolved_supernode = new_addr;
         
-        /* Clear alternate address - domain resolution already picked the best address */
-        memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
+        /* Re-resolve alternate address for dual-stack registration */
+        {
+            int alt_af = (eee->supernode.family == AF_INET6) ? AF_INET : AF_INET6;
+            int can_resolve = (alt_af == AF_INET6) ? (eee->udp_sock6 != -1) : (eee->udp_sock != -1);
+            memset(&eee->supernode_alt, 0, sizeof(n2n_sock_t));
+            if (can_resolve) {
+                supernode2addr(&eee->supernode_alt, alt_af, eee->sn_ip_array[eee->sn_idx]);
+            }
+        }
         
         traceEvent(TRACE_NORMAL, "Re-registering with supernode at new address");
         
@@ -4610,24 +4706,16 @@ if (argc > 1 && argv[1][0] != '-' && access(argv[1], R_OK) == 0) {
     if (setup_sockets(&eee, local_port) < 0)
         return -1;
 
-    /* Resolve alternate supernode address only for pure IP addresses (not domains) */
+    /* Resolve alternate supernode address for dual-stack registration */
     if (eee.supernode_alt.family == 0) {
         char *sn_host = eee.sn_ip_array[eee.sn_idx];
-        struct in_addr ipv4_test;
-        struct in6_addr ipv6_test;
-        
-        /* Check if it's a pure IP address */
-        if (inet_pton(AF_INET, sn_host, &ipv4_test) == 1 || 
-            inet_pton(AF_INET6, sn_host, &ipv6_test) == 1) {
-            
-            int alt_af = (eee.supernode.family == AF_INET6) ? AF_INET : AF_INET6;
-            int can_resolve = (alt_af == AF_INET6) ? (eee.udp_sock6 != -1) : (eee.udp_sock != -1);
-            
-            if (can_resolve && supernode2addr(&eee.supernode_alt, alt_af, sn_host) == 0) {
-                n2n_sock_str_t sockbuf_alt;
-                traceEvent(TRACE_INFO, "Supernode alt address resolved: %s",
-                           sock_to_cstr(sockbuf_alt, &eee.supernode_alt));
-            }
+        int alt_af = (eee.supernode.family == AF_INET6) ? AF_INET : AF_INET6;
+        int can_resolve = (alt_af == AF_INET6) ? (eee.udp_sock6 != -1) : (eee.udp_sock != -1);
+
+        if (can_resolve && supernode2addr(&eee.supernode_alt, alt_af, sn_host) == 0) {
+            n2n_sock_str_t sockbuf_alt;
+            traceEvent(TRACE_INFO, "Supernode alt address resolved: %s",
+                       sock_to_cstr(sockbuf_alt, &eee.supernode_alt));
         }
     }
 
